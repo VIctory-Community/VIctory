@@ -6988,11 +6988,15 @@ impl<'a> Lower<'a> {
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
             "image_sample_c_lz" => (65, true),
-            "image_sample_d" => (63, true),
+            "image_sample_d" | "image_sample_d_cl" => (63, true),
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            // A gather's level of detail is explicit only on the console; the
+            // host gathers at the implicit level (level 0 in compute), so the
+            // level word the address holds is dropped.
+            "image_gather4" | "image_gather4_l" | "image_gather4_l_o" | "image_gather4_lz"
+            | "image_gather4_lz_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -7058,7 +7062,17 @@ impl<'a> Lower<'a> {
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let grads = if op == 63 { 2 * spatial } else { 0 };
+            // A cube's explicit gradients hold two components per direction,
+            // which the host's gradients cannot express; sample with the
+            // host's own derivatives instead and keep the clamp.
+            let implicit_grad = op == 63 && kind == 5;
+            let grads = if implicit_grad {
+                4
+            } else if op == 63 {
+                2 * spatial
+            } else {
+                0
+            };
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
@@ -7074,7 +7088,7 @@ impl<'a> Lower<'a> {
                 *slot = to_float(self, x);
             }
             if kind == 5 {
-                if *unorm || op == 63 || op == 81 {
+                if *unorm || (op == 63 && !implicit_grad) || op == 81 {
                     return Err("a cube sample with texel coordinates, gradients or a level query");
                 }
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
@@ -7115,6 +7129,15 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
+            // `_cl` forms clamp the sampled level of detail: the address word
+            // after the coordinates (after the gradients on `_d_cl`).
+            let clamp = if name.ends_with("_cl") {
+                let x = addr_val(self, first + grads + coords)?;
+                to_float(self, x)
+            } else {
+                self.s.m.f32(0)
+            };
+            let op = if implicit_grad { 60 } else { op };
             let offsets = if kind == 5 {
                 0
             } else {
@@ -7125,31 +7148,61 @@ impl<'a> Lower<'a> {
             for o in os.iter_mut().take(offsets) {
                 *o = zero;
             }
+            // Programmable offsets: x in bits 0-5, y in 8-13, z in 16-21,
+            // signed. A word whose offsets all fit -8..7 stays an immediate
+            // offset; anything else moves into the coordinates instead.
+            let word = if offset_word {
+                Some(addr_val(self, 0)?)
+            } else {
+                None
+            };
+            let mut immediate = word.and_then(|w| self.s.m.int_value(w));
+            if let Some(w) = word {
+                for (k, at) in [(0, 26), (1, 18), (2, 10)].into_iter().take(offsets) {
+                    let left = self.s.m.i32(at);
+                    let t = self.s.m.bin(c, Bin::Shl, w, left);
+                    let k26 = self.s.m.i32(26);
+                    os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
+                }
+            }
+            if let Some(w) = immediate {
+                let w = w as u32;
+                for (k, o) in os.iter_mut().enumerate().take(offsets) {
+                    let x = (w >> (8 * k) & 0x3F) as i32;
+                    let x = if x >= 32 { x - 64 } else { x };
+                    if !(-8..=7).contains(&x) {
+                        immediate = None;
+                    }
+                    *o = self.s.m.i32(x as u32);
+                }
+            }
+            if offset_word && op != 73 && immediate.is_none() {
+                // The host will not take a texel offset that is computed at
+                // run time, only a literal one: shift the coordinates by the
+                // offset in normalized units at level zero instead.
+                let i32t = self.s.t.i32;
+                let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                let z = self.s.m.i32(0);
+                let d = self
+                    .s
+                    .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, z]);
+                for k in 0..spatial.min(3) {
+                    let n = self.s.m.extract(c, d, k as u32);
+                    let n = self.s.m.cast(c, Cast::UiToFp, n, self.s.t.f32);
+                    let off = self.as_float(os[k]);
+                    let shift = self.s.m.bin(c, Bin::SDiv, off, n);
+                    cs[k] = self.s.m.bin(c, Bin::Add, cs[k], shift);
+                }
+                for o in os.iter_mut().take(offsets) {
+                    *o = zero;
+                }
+            }
             let mut args = vec![h, sh];
             args.extend(&cs);
             match op {
                 60 => {
-                    if offset_word {
-                        // DXIL takes immediate offsets in -8..=7; the
-                        // console's are 6-bit and may be computed.
-                        let w = addr_val(self, 0)?;
-                        let w = self
-                            .s
-                            .m
-                            .int_value(w)
-                            .ok_or("a sample offset that is not constant")?
-                            as u32;
-                        for (k, o) in os.iter_mut().enumerate().take(offsets) {
-                            let x = (w >> (8 * k) & 0x3F) as i32;
-                            let x = if x >= 32 { x - 64 } else { x };
-                            if !(-8..=7).contains(&x) {
-                                return Err("a sample offset past -8..7");
-                            }
-                            *o = self.s.m.i32(x as u32);
-                        }
-                    }
                     args.extend(&os);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s
                         .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
@@ -7157,7 +7210,7 @@ impl<'a> Lower<'a> {
                     let bias = addr_val(self, 0)?;
                     let bias = self.as_float(bias);
                     args.extend(&os);
-                    args.extend([bias, fu]);
+                    args.extend([bias, clamp]);
                     self.s.op(
                         c,
                         "sampleBias.f32",
@@ -7177,7 +7230,7 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os);
                     args.extend(g);
-                    args.push(fu);
+                    args.push(clamp);
                     self.s.op(
                         c,
                         "sampleGrad.f32",
@@ -7225,16 +7278,6 @@ impl<'a> Lower<'a> {
                     }
                     if dmask.count_ones() != 1 {
                         return Err("a gather of several channels");
-                    }
-                    if offset_word {
-                        let w = addr_val(self, 0)?;
-                        for (k, at) in [(0, 26), (1, 18)] {
-                            // Bits at..at+5 sign-extended: shift up, then down.
-                            let left = self.s.m.i32(at);
-                            let t = self.s.m.bin(c, Bin::Shl, w, left);
-                            let k26 = self.s.m.i32(26);
-                            os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
-                        }
                     }
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
